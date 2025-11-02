@@ -2,9 +2,11 @@
 
 Organise your series video files into Plex-friendly folders and names.
 
+_Originally created to help cleanup and organise the brilliant [Thomas and Friends - The Complete Series (UK - HD) archive from archive.org](https://archive.org/details/thomas-and-friends-the-complete-series-uk)_
+
 ## Quick Start
 
-- Download the latest release ZIP for this tool.
+- [Download the latest release ZIP for this tool.](https://github.com/92jackson/episode-organiser/releases)
 - Extract the ZIP into the same folder where your series video files are stored.
 - Put the series CSV file in that same folder.
 - Double‑click `episode_organiser.ps1` to start.
