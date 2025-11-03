@@ -1,6 +1,6 @@
 <#
 Repo:		 https://github.com/92jackson/episode-organiser
-Ver:		 1.1.0
+Ver:		 1.1.1
 Support:	 https://discord.gg/e3eXGTJbjx
 
 	Episode Organiser for Plex-style TV series management
@@ -10,6 +10,7 @@ Support:	 https://discord.gg/e3eXGTJbjx
 	- Supports quick-run and guided workflows with preview and confirmation
 	- Handles subtitles/thumbnails (sidecars): renames/moves in sync with videos
 	- Maintains restore points to undo last operation
+	- Supports filenames containing multiple episode codes (e.g. `S01E01-E02`)
 
 	Usage:
 	& .\episode_organiser.ps1 -StartDir ".\test_series\Thomas & Friends (1984)\Season 1" -LoadCsvPath ".\episode_datasheets\thomas_&_friends_(1984).csv"
@@ -1271,22 +1272,64 @@ function Extract-Title($filename) {
 }
 
 # Extract episode code from filename
+function Extract-EpisodeCodes($filename) {
+	# Normalize unicode dashes
+	$norm = $filename -replace '[–—]', '-'
+	# Find season first
+	$sm = [regex]::Match($norm, '(?i)s(\d{1,2})')
+	if (-not $sm.Success) { return $null }
+	$season = [int]$sm.Groups[1].Value
+	# Collect explicit E/Ep tokens (handles SXXEYYEZZEAA and SXX EpYY EpZZ)
+	$exp = [regex]::Matches($norm, '(?i)(?:e|ep)\s*(\d{2})')
+	$epNums = @()
+	foreach ($m in $exp) { $epNums += ("{0:D2}" -f [int]$m.Groups[1].Value) }
+	# Collect chained hyphen numbers following an E/Ep token (handles SXXEYY- ZZ - AA)
+	$chain = [regex]::Matches($norm, '(?i)(?<=\b(?:e|ep)\s*\d{2})[-_\s]+(\d{2})\b')
+	foreach ($m in $chain) { $epNums += ("{0:D2}" -f [int]$m.Groups[1].Value) }
+	# Deduplicate while preserving order
+	$seen = @{}
+	$ordered = @()
+	foreach ($n in $epNums) { if (-not $seen.ContainsKey($n)) { $seen[$n] = $true; $ordered += $n } }
+	if ($ordered.Count -ge 1) {
+		$codes = @()
+		foreach ($n in $ordered) { $codes += ("s{0:D2}e{1}" -f $season, $n) }
+		return ,$codes
+	}
+	# Fallback: single episode code
+	$single = $script:episodeCodeRegex.Match($norm)
+	if ($single.Success) {
+		$season = [int]$single.Groups[1].Value
+		$ep = [int]$single.Groups[2].Value
+		return @("s{0:D2}e{1:D2}" -f $season, $ep)
+	}
+	return $null
+}
+
 function Extract-EpisodeCode($filename) {
-    # Only extract if the filename actually contains sXXeXX format
-    if ($filename -match $script:episodeCodeRegex) {
-        $seriesNum = [int]$matches[1]
-        $episodeNum = [int]$matches[2]
-        return "s{0:D2}e{1:D2}" -f $seriesNum, $episodeNum
-    }
-    # Also support movie codes mXX
-    $m = [regex]::Match($filename, '(?i)\bm(\d{2})\b')
-    if ($m.Success) {
-        $mNum = [int]$m.Groups[1].Value
-        return "m{0:D2}" -f $mNum
-    }
-    
-    # Don't convert decimal numbers to episode codes - only return actual episode codes
-    return $null
+	# Prefer multi-episode composite when present
+	$codes = Extract-EpisodeCodes $filename
+	if ($codes -and $codes.Count -gt 1) {
+		$first = $codes[0]
+		$sm = [regex]::Match($first, '(?i)^s(\d{2})e(\d{2})$')
+		if ($sm.Success) {
+			$season = [int]$sm.Groups[1].Value
+			$epNums = @()
+			foreach ($c in $codes) {
+				$cm = [regex]::Match($c, '(?i)^s(\d{2})e(\d{2})$')
+				if ($cm.Success) { $epNums += ("{0:D2}" -f [int]$cm.Groups[2].Value) }
+			}
+			$joined = ($epNums | ForEach-Object { "e$_" }) -join ''
+			return ("s{0:D2}" -f $season) + $joined
+		}
+	}
+	if ($codes -and $codes.Count -eq 1) { return $codes[0] }
+
+	# Also support movie codes mXX present in filenames
+	$m = [regex]::Match($filename, '(?i)\bm(\d{2})\b')
+	if ($m.Success) { return "m{0:D2}" -f [int]$m.Groups[1].Value }
+
+	# Only return actual episode codes
+	return $null
 }
 
 # Find duplicates (.ia files and their originals)
@@ -1713,6 +1756,52 @@ function Get-MatchingPreferenceWithReturn {
 	return [int]$choice
 }
 
+# Build a composite episode object for multi-episode files
+function New-CompositeEpisode($episodeCodes) {
+	if (-not $episodeCodes -or $episodeCodes.Count -lt 2) { return $null }
+	$eps = @()
+	foreach ($code in $episodeCodes) {
+		$canonical = $code.ToLower()
+		# Map s00eNN extracted from filename to mNN dataset code for movies
+		$mMap = [regex]::Match($canonical, '^s00e(\d{2})$')
+		if ($mMap.Success) { $canonical = ("m{0:D2}" -f [int]$mMap.Groups[1].Value) }
+		if ($script:episodesBySeriesEpisode.ContainsKey($canonical)) {
+			$eps += $script:episodesBySeriesEpisode[$canonical]
+		}
+	}
+	if ($eps.Count -lt 2) { return $null }
+
+	# Derive composite series code: sXXeNN[eMM...]
+	$season = $null
+	$epNums = @()
+	$firstMatch = [regex]::Match($episodeCodes[0], '(?i)^s(\d{2})e(\d{2})$')
+	if ($firstMatch.Success) { $season = [int]$firstMatch.Groups[1].Value }
+	foreach ($c in $episodeCodes) {
+		$cm = [regex]::Match($c, '(?i)^s(\d{2})e(\d{2})$')
+		if ($cm.Success) { $epNums += ("{0:D2}" -f [int]$cm.Groups[2].Value) }
+	}
+	$seriesCode = if ($season -ne $null -and $epNums.Count -ge 2) {
+		$joined = ($epNums | ForEach-Object { "e$_" }) -join ''
+		("s{0:D2}" -f $season) + $joined
+	} else { $eps[0].SeriesEpisode }
+
+	# Combine titles (use ' + ' separator)
+	$title = ($eps | ForEach-Object { $_.Title } | Where-Object { $_ } | ForEach-Object { $_.Trim() }) -join ' + '
+	# If air dates are identical, keep one; otherwise blank
+	$dates = $eps | ForEach-Object { $_.AirDate } | Where-Object { $_ } | Select-Object -Unique
+	$airDate = if ($dates.Count -eq 1) { $dates[0] } else { $null }
+	# Use the first episode's overall number to keep downstream sorting stable
+	$number = $eps[0].Number
+
+	return [PSCustomObject]@{
+		Title = $title
+		SeriesEpisode = $seriesCode
+		AirDate = $airDate
+		Number = $number
+		MultiEpisodes = $eps
+	}
+}
+
 # Find matching episode based on preference
 function Find-MatchingEpisode($file, $episodeData, $matchingPreference) {
     $extractedTitle = Extract-Title $file.Name
@@ -1736,6 +1825,12 @@ function Find-MatchingEpisode($file, $episodeData, $matchingPreference) {
 					if ($title -like "*$normalisedTitle*" -or $normalisedTitle -like "*$title*") { $candidates += $title }
 				}
 				if ($candidates.Count -gt 0) {
+					# If the filename encodes multiple episodes, prefer a composite match
+					$codesMulti = Extract-EpisodeCodes $file.Name
+					if ($codesMulti -and $codesMulti.Count -gt 1) {
+						$comp = New-CompositeEpisode $codesMulti
+						if ($comp) { return $comp }
+					}
 					if ($exPart) {
 						$preferred = $candidates | Where-Object { $_ -match "\bpart\s+$exPart\b" } | Select-Object -First 1
 						if ($preferred) { return $script:episodesByTitle[$preferred] }
@@ -1758,8 +1853,13 @@ function Find-MatchingEpisode($file, $episodeData, $matchingPreference) {
 				}
 			} else {
 				# Only fallback to episode code if no title could be extracted
-				$code = Extract-EpisodeCode $file.Name
-				if ($code) {
+				$codes = Extract-EpisodeCodes $file.Name
+				if ($codes -and $codes.Count -gt 1) {
+					$composite = New-CompositeEpisode $codes
+					if ($composite) { return $composite }
+				}
+				if ($codes -and $codes.Count -ge 1) {
+					$code = $codes[0]
 					$canonical = $code.ToLower()
 					# Map s00eNN extracted from filename to mNN dataset code for movies
 					$mMap = [regex]::Match($canonical, '^s00e(\d{2})$')
@@ -1772,8 +1872,13 @@ function Find-MatchingEpisode($file, $episodeData, $matchingPreference) {
 		}
 		
 		2 { # Match episode code (with fallback to title)
-			$code = Extract-EpisodeCode $file.Name
-			if ($code) {
+			$codes = Extract-EpisodeCodes $file.Name
+			if ($codes -and $codes.Count -gt 1) {
+				$composite = New-CompositeEpisode $codes
+				if ($composite) { return $composite }
+			}
+			if ($codes -and $codes.Count -ge 1) {
+				$code = $codes[0]
 				$canonical = $code.ToLower()
 				# Map s00eNN extracted from filename to mNN dataset code for movies
 				$mMap = [regex]::Match($canonical, '^s00e(\d{2})$')
@@ -1992,6 +2097,13 @@ function Get-FormattedFilename($episode, $format, $extension) {
 
 	# Handle all non-movie episodes uniformly (including s00 specials)
 	$upperSeriesEpisode = if ($episode.SeriesEpisode) { $episode.SeriesEpisode.ToUpper() } else { "" }
+
+	# If we have a composite multi-episode, ensure title is a clean joined string
+	if ($episode.MultiEpisodes -and -not $episode.Title) {
+		$joinedTitle = ($episode.MultiEpisodes | ForEach-Object { $_.Title } | Where-Object { $_ } | ForEach-Object { $_.Trim() }) -join ' + '
+		$titleSafe = $joinedTitle
+		$cleanTitle = $titleSafe -replace '\s+', '.' -replace '[&]', '&' -replace '[^\w&.-]', ''
+	}
 	switch ($format) {
 		1 { return (Sanitize-FileName "$seriesDisplay - $($episode.SeriesEpisode) - $($episode.Title)$extension") }
 		2 { return (Sanitize-FileName "$($episode.SeriesEpisode) - $($episode.Title)$extension") }
@@ -2022,10 +2134,11 @@ function Get-SeriesFolderName($episode) {
 		$folder = Sanitize-FileName $name
 		return "$($script:seriesRootFolderName)/Movies/$folder"
 	}
-	# Extract series number from SeriesEpisode (e.g., "s01e01" -> "01")
-	if ($episode.SeriesEpisode -match $script:seriesCodeRegex) {
-		$seriesNum = $matches[1]
-		return "$($script:seriesRootFolderName)/Season $([int]$seriesNum)"
+	# Extract series number from SeriesEpisode (supports multi-episode codes like sXXeYYeZZ)
+	$sm = [regex]::Match($episode.SeriesEpisode, '(?i)^s(\d+)\s*e')
+	if ($sm.Success) {
+		$seriesNum = [int]$sm.Groups[1].Value
+		return "$($script:seriesRootFolderName)/Season $seriesNum"
 	}
 	# Fallback for any unexpected format
 	return "$($script:seriesRootFolderName)/Unknown"
@@ -2109,20 +2222,37 @@ function Generate-FileAnalysisReport($matchingPreference, $namingFormat = 1) {
 				$discrepancyDetails += "Extracted Ep: '$extractedEpisodeNum' vs Reference Ep: '$($matchedEpisode.Number)'"
 			}
             
-            # Check episode code discrepancy
-            $extractedEpisodeCode = Extract-EpisodeCode $file.Name
-            if ($extractedEpisodeCode -and $extractedEpisodeCode -ne $matchedEpisode.SeriesEpisode) {
-                # Treat legacy specials code s00eNN in filename as equivalent to mNN in dataset
-                $isLegacySpecial = [regex]::Match($extractedEpisodeCode, '^s00e(\d{2})$')
-                $isMovieRef = [regex]::Match($matchedEpisode.SeriesEpisode, '^m(\d{2})$')
-                $equivalentMovie = ($isLegacySpecial.Success -and $isMovieRef.Success -and ([int]$isLegacySpecial.Groups[1].Value -eq [int]$isMovieRef.Groups[1].Value))
-                if (-not $equivalentMovie) {
-                $hasDiscrepancy = $true
-                $discrepancyType = if ($discrepancyType) { "$discrepancyType + Episode Code Mismatch" } else { "Episode Code Mismatch" }
-                $discrepancyDetails += if ($discrepancyDetails) { " | " } else { "" }
-                $discrepancyDetails += "Extracted Code: '$extractedEpisodeCode' vs Reference Code: '$($matchedEpisode.SeriesEpisode)'"
-                }
-            }
+			# Check episode code discrepancy (with multi-episode equivalence)
+			$extractedEpisodeCode = Extract-EpisodeCode $file.Name
+			if ($extractedEpisodeCode) {
+				$codesMatch = $false
+				if ($matchedEpisode.MultiEpisodes) {
+					# Exact composite match
+					if ($extractedEpisodeCode -eq $matchedEpisode.SeriesEpisode) { $codesMatch = $true }
+					else {
+						# Single-code extracted matching any constituent episode
+						$expNums = @()
+						foreach ($ep in $matchedEpisode.MultiEpisodes) {
+							$mm = [regex]::Match($ep.SeriesEpisode, '(?i)^s\d{2}e(\d{2})$')
+							if ($mm.Success) { $expNums += ("{0:D2}" -f [int]$mm.Groups[1].Value) }
+						}
+						$exNums = [regex]::Matches($extractedEpisodeCode, '(?i)e(\d{2})') | ForEach-Object { "{0:D2}" -f [int]$_.Groups[1].Value }
+						if ($exNums.Count -eq 1 -and ($expNums -contains $exNums[0])) { $codesMatch = $true }
+					}
+				} else {
+					# Treat legacy specials code s00eNN in filename as equivalent to mNN in dataset
+					$isLegacySpecial = [regex]::Match($extractedEpisodeCode, '^s00e(\d{2})$')
+					$isMovieRef = [regex]::Match($matchedEpisode.SeriesEpisode, '^m(\d{2})$')
+					$equivalentMovie = ($isLegacySpecial.Success -and $isMovieRef.Success -and ([int]$isLegacySpecial.Groups[1].Value -eq [int]$isMovieRef.Groups[1].Value))
+					if ($equivalentMovie) { $codesMatch = $true }
+				}
+				if (-not $codesMatch -and $extractedEpisodeCode -ne $matchedEpisode.SeriesEpisode) {
+					$hasDiscrepancy = $true
+					$discrepancyType = if ($discrepancyType) { "$discrepancyType + Episode Code Mismatch" } else { "Episode Code Mismatch" }
+					$discrepancyDetails += if ($discrepancyDetails) { " | " } else { "" }
+					$discrepancyDetails += "Extracted Code: '$extractedEpisodeCode' vs Reference Code: '$($matchedEpisode.SeriesEpisode)'"
+				}
+			}
             
             $renameInfo = [PSCustomObject]@{
                 File = $file
